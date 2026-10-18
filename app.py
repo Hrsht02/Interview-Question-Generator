@@ -48,8 +48,16 @@ def clean_text(text: str) -> str:
 
 def make_documents(files) -> List[Document]:
     docs = []
+    remaining_chars = 250_000
     for file in files:
+        if remaining_chars <= 0:
+            st.warning("Input text limit reached (250,000 characters). Remaining files were skipped to protect memory.")
+            break
         raw = clean_text(extract_text(file))
+        if len(raw) > remaining_chars:
+            raw = raw[:remaining_chars]
+            st.warning(f"Text from {file.name} was truncated to keep processing within the memory limit.")
+        remaining_chars -= len(raw)
         if not raw:
             st.warning(f"No extractable text found in {file.name}. Scanned PDFs may need OCR first.")
             continue
