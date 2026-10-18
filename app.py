@@ -2,7 +2,7 @@ import io
 import json
 import os
 import re
-import hashlib
+from collections import Counter
 from typing import List, Dict, Any
 
 import streamlit as st
@@ -11,10 +11,7 @@ from pypdf import PdfReader
 from docx import Document as DocxDocument
 
 from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 load_dotenv()
@@ -22,7 +19,6 @@ load_dotenv()
 st.set_page_config(page_title="Interview Question Generator", page_icon="🎯", layout="wide")
 
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-DEFAULT_EMBEDDING = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
 
 def extract_text(uploaded_file) -> str:
@@ -60,8 +56,12 @@ def make_documents(files) -> List[Document]:
         docs.append(Document(page_content=raw, metadata={"source": file.name}))
     if not docs:
         raise ValueError("No readable text was found in the uploaded files.")
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=160, add_start_index=True)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=80, add_start_index=True)
     chunks = splitter.split_documents(docs)
+    # Bound memory use on small hosting instances.
+    if len(chunks) > 300:
+        chunks = chunks[:300]
+        st.warning("The document set was large, so only the first 300 text chunks were processed. Upload smaller files for better coverage.")
     for i, chunk in enumerate(chunks):
         chunk.metadata["chunk_id"] = i
     return chunks
@@ -83,9 +83,30 @@ def invoke_text(llm, prompt: str) -> str:
     return str(response.content).strip()
 
 
-def retrieve_context(vector_store, topic: str, k: int):
-    query = topic.strip() or "Important concepts and key ideas in the uploaded material"
-    return vector_store.similarity_search(query, k=k)
+def retrieve_context(chunks, topic: str, k: int):
+    """Lightweight lexical retrieval; avoids loading a neural embedding model or vector DB."""
+    stop_words = {
+        "the", "and", "for", "with", "that", "this", "from", "into", "are", "was",
+        "were", "you", "your", "what", "when", "where", "which", "how", "why",
+        "about", "using", "use", "can", "could", "should", "would", "have", "has",
+        "had", "not", "but", "all", "any", "its", "their", "they", "them", "then",
+        "than", "also", "each", "such", "these", "those", "our", "out", "more"
+    }
+    query = (topic or "").lower()
+    terms = [t for t in re.findall(r"[a-zA-Z0-9_+#.-]{2,}", query) if t not in stop_words]
+    if not terms:
+        return chunks[:min(k, len(chunks))]
+    scored = []
+    for index, chunk in enumerate(chunks):
+        text = chunk.page_content.lower()
+        words = re.findall(r"[a-zA-Z0-9_+#.-]{2,}", text)
+        counts = Counter(words)
+        score = sum(min(counts.get(term, 0), 4) for term in terms)
+        # Stable tie-break preserves document order.
+        scored.append((score, -index, chunk))
+    scored.sort(reverse=True, key=lambda item: (item[0], item[1]))
+    matches = [item[2] for item in scored[:k] if item[0] > 0]
+    return matches or chunks[:min(k, len(chunks))]
 
 
 def generate_questions(llm, chunks, topic: str, difficulty: str, count: int, role: str) -> List[Dict[str, str]]:
@@ -189,9 +210,8 @@ def main():
         env_key = os.getenv("GEMINI_API_KEY", "")
         api_key = st.text_input("Gemini API key", value=env_key, type="password", help="Prefer .env for local use. Never commit your API key.")
         model_name = st.text_input("Gemini model", value=DEFAULT_MODEL)
-        embedding_name = st.text_input("Hugging Face embedding model", value=DEFAULT_EMBEDDING)
         st.divider()
-        st.caption("The embedding model runs locally. The Gemini API is used for generation.")
+        st.caption("Lightweight local text retrieval is used; Gemini API generates questions and answers.")
 
     left, right = st.columns([1, 1])
     with left:
@@ -218,30 +238,22 @@ def main():
             with st.spinner("Extracting text and splitting documents into chunks..."):
                 chunks = make_documents(files)
             st.info(f"Prepared {len(chunks)} text chunks from {len(files)} file(s).")
-            with st.spinner("Loading embedding model and building the vector index..."):
-                embeddings = HuggingFaceEmbeddings(
-                    model_name=embedding_name,
-                    model_kwargs={"device": "cpu"},
-                    encode_kwargs={"normalize_embeddings": True},
-                )
-                # A unique in-memory collection per run; no persistent user data or login.
-                collection = "interview_" + hashlib.sha1(
-                    ("|".join(f.name for f in files) + topic + str(len(chunks))).encode("utf-8")
-                ).hexdigest()[:12]
-                vector_store = Chroma.from_documents(
-                    documents=chunks,
-                    embedding=embeddings,
-                    collection_name=collection,
-                )
-            with st.spinner("Retrieving relevant context and generating questions with Gemini..."):
+            with st.spinner("Selecting relevant text and generating questions with Gemini..."):
+                retrieved = retrieve_context(chunks, topic, retrieval_k)
                 llm = get_llm(api_key, model_name)
-                retrieved = retrieve_context(vector_store, topic, retrieval_k)
                 questions = generate_questions(llm, retrieved, topic, difficulty, count, role)
-                refined = [refine_question(llm, q, retrieved, topic) for q in questions]
-            with st.spinner("Generating answers in a separate stage..."):
+            with st.spinner("Generating interview-ready answers..."):
                 results = []
-                for item in refined:
+                for item in questions:
                     answer = generate_answer(llm, item["question"], retrieved)
+                    item["sources"] = [
+                        {
+                            "source": d.metadata.get("source", "document"),
+                            "chunk_id": d.metadata.get("chunk_id", "?"),
+                            "text": d.page_content,
+                        }
+                        for d in retrieved
+                    ]
                     results.append({**item, "answer": answer})
             st.session_state["results"] = results
             st.session_state["run_meta"] = {
@@ -254,7 +266,7 @@ def main():
             st.success(f"Generated {len(results)} question-and-answer pair(s).")
         except Exception as exc:
             st.error(f"Could not complete generation: {exc}")
-            st.caption("Check that your Gemini API key/model are valid, your network is available, and the uploaded documents contain extractable text.")
+            st.caption("Check the Gemini API key/model, network access, and that uploaded documents contain extractable text. If the host restarts, reduce document size.")
 
     if "results" in st.session_state:
         st.divider()
