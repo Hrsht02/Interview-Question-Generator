@@ -34,8 +34,8 @@ The question set is generated in one model call. The answer Refine chain makes o
 
 ## Model routing
 - Primary generation provider: GroqCloud through the Groq Responses API.
-- Generation fallback: Gemini (gemini-2.5-flash) is attempted when Grok fails.
-- Embedding provider: Gemini Embeddings. This is used for document and query vectors even when Grok handles text generation.
+- Generation fallback: Gemini (gemini-2.5-flash) is attempted when Groq fails.
+- Embedding provider: Gemini Embeddings. This is used for document and query vectors even when Groq handles text generation.
 - Transient Groq failures receive bounded retries. If Groq still fails, the same generation step falls back to Gemini.
 - Malformed JSON receives one format-correction attempt.
 
