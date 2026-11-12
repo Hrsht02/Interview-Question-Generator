@@ -1,4 +1,5 @@
 import io
+import logging
 import json
 import os
 import re
@@ -28,6 +29,8 @@ FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
 RETRIEVAL_K = 5
 MAX_UPLOAD_MB = 20
 MAX_RETRIES = 2
+
+logger = logging.getLogger("interview_generator")
 
 st.markdown("""
 <style>
@@ -340,8 +343,17 @@ def main():
                 }
                 st.success(f"Generated {len(results)} interview question-and-answer pairs.")
             except Exception as exc:
-                st.error(str(exc))
-                st.caption("Your uploaded files stay in this session. Check the Render service environment if the generation service is not configured.")
+                # Keep the complete provider traceback in Render logs for diagnosis,
+                # while showing a safe, actionable message in the browser.
+                logger.exception("Interview question generation failed")
+                detail = str(exc).strip()
+                st.error(detail or f"Generation failed ({type(exc).__name__}).")
+                st.caption(
+                    f"Technical detail: {type(exc).__name__}. "
+                    "For the exact provider response, open Render → your service → Logs "
+                    "and inspect the latest 'Interview question generation failed' entry. "
+                    "Do not share your API key or environment-variable values."
+                )
 
     if "results" in st.session_state:
         st.write("")
