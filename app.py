@@ -324,7 +324,6 @@ def main():
             st.caption("Text-based PDFs are supported. Scanned/image-only PDFs need OCR first.")
 
     with right:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-kicker">Step 02 · Interview setup</div>', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Personalise your practice</div>', unsafe_allow_html=True)
         st.markdown('<div class="section-help">Choose what you are preparing for. Retrieval settings are optimised automatically.</div>', unsafe_allow_html=True)
@@ -332,7 +331,6 @@ def main():
         role = st.text_input("Target role", placeholder="e.g. Data Analyst, GenAI Developer")
         difficulty = st.selectbox("Question difficulty", ["Beginner", "Intermediate", "Advanced"], index=1)
         count = st.select_slider("Number of questions", options=[3, 5, 7, 10], value=5)
-        st.markdown('</div>', unsafe_allow_html=True)
 
     st.write("")
     _, action_col, _ = st.columns([1, 1.35, 1])
