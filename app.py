@@ -27,7 +27,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.7").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 RETRIEVAL_K = 5
 MAX_UPLOAD_MB = 20
@@ -227,20 +227,20 @@ def _is_transient(exc: Exception) -> bool:
 
 def invoke_with_resilience(prompt: str) -> str:
     """Use Grok first, then Gemini; log actionable provider errors without secrets."""
-    grok_key = os.getenv("XAI_API_KEY", "").strip()
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
     primary_error = None
 
-    if grok_key:
+    if groq_key:
         client = OpenAI(
-            api_key=grok_key,
-            base_url="https://api.x.ai/v1",
+            api_key=groq_key,
+            base_url="https://api.groq.com/openai/v1",
             timeout=180.0,
             max_retries=0,
         )
         for attempt in range(MAX_RETRIES + 1):
             try:
                 response = client.responses.create(
-                    model=GROK_MODEL,
+                    model=GROQ_MODEL,
                     input=prompt,
                     reasoning={"effort": "low"},
                     store=False,
@@ -252,18 +252,18 @@ def invoke_with_resilience(prompt: str) -> str:
             except Exception as exc:
                 primary_error = exc
                 logger.warning(
-                    "Grok request failed (model=%s, attempt=%s/%s): %s",
-                    GROK_MODEL, attempt + 1, MAX_RETRIES + 1,
+                    "Groq request failed (model=%s, attempt=%s/%s): %s",
+                    GROQ_MODEL, attempt + 1, MAX_RETRIES + 1,
                     _error_summary(exc),
                 )
                 if not _is_transient(exc) or attempt >= MAX_RETRIES:
                     break
                 time.sleep(1.0 * (2 ** attempt))
     else:
-        primary_error = RuntimeError("XAI_API_KEY is missing.")
-        logger.error("Grok is not configured: XAI_API_KEY is missing.")
+        primary_error = RuntimeError("GROQ_API_KEY is missing.")
+        logger.error("Groq is not configured: GROQ_API_KEY is missing.")
 
-    logger.info("Attempting Gemini fallback after Grok failure.")
+    logger.info("Attempting Gemini fallback after Groq failure.")
     try:
         response = build_gemini_llm().invoke(prompt)
         content = response.content
@@ -282,7 +282,7 @@ def invoke_with_resilience(prompt: str) -> str:
 
         if _is_quota_exhausted(fallback_error):
             raise RuntimeError(
-                "Grok generation failed: "
+                "Groq generation failed: "
                 + _error_summary(primary_error, 450)
                 + ". Gemini fallback is currently unavailable because its API quota "
                 "has been exhausted. Check Gemini usage/billing or wait for quota reset. "
@@ -290,7 +290,7 @@ def invoke_with_resilience(prompt: str) -> str:
             ) from fallback_error
 
         raise RuntimeError(
-            "Grok generation failed: "
+            "Groq generation failed: "
             + _error_summary(primary_error, 450)
             + ". Gemini fallback also failed: "
             + fallback_summary
