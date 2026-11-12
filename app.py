@@ -226,7 +226,7 @@ def _is_transient(exc: Exception) -> bool:
 
 
 def invoke_with_resilience(prompt: str) -> str:
-    """Use Grok first, then Gemini; log actionable provider errors without secrets."""
+    """Use Groq first, then Gemini; log actionable provider errors without secrets."""
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
     primary_error = None
 
@@ -247,7 +247,7 @@ def invoke_with_resilience(prompt: str) -> str:
                 )
                 generated = _extract_text(response)
                 if not generated:
-                    raise RuntimeError("Grok returned an empty response.")
+                    raise RuntimeError("Groq returned an empty response.")
                 return generated
             except Exception as exc:
                 primary_error = exc
@@ -729,7 +729,7 @@ def main():
     st.divider()
     st.markdown(
         '<div class="small-note"><strong>How it works:</strong> Document extraction → Recursive chunking → Gemini embeddings → FAISS semantic search → Question generation → Initial answer → Sequential Refine chain → Interview-ready Q&A</div>'
-        '<div class="small-note">Gemini creates embeddings · Grok generates questions and runs the Refine chain, with Gemini fallback · Documents and FAISS index are processed in memory for this session.</div>',
+        '<div class="small-note">Gemini creates embeddings · Groq generates questions and runs the Refine chain, with Gemini fallback · Documents and FAISS index are processed in memory for this session.</div>',
         unsafe_allow_html=True,
     )
 
