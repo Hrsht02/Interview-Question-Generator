@@ -39,19 +39,19 @@ st.markdown("""
 :root { --ink:#172033; --muted:#697386; --line:#e7eaf0; --accent:#635bff; --soft:#f6f7fb; }
 html, body, [class*="css"] { font-family:'DM Sans',sans-serif; color:var(--ink); }
 .stApp { background: #fbfcff; }
-.block-container { max-width: 1240px; padding-top: 2rem; padding-bottom: 4rem; }
+.block-container { max-width: 1240px; padding-top: .65rem; padding-bottom: 1.5rem; }
 header[data-testid="stHeader"] { background:rgba(251,252,255,.9); }
 #MainMenu, footer { visibility:hidden; }
-.hero { padding: 1.35rem 0 1.5rem; }
+.hero { padding: .35rem 0 .7rem; }
 .eyebrow { color:var(--accent); font-size:.76rem; font-weight:700; letter-spacing:.12em; text-transform:uppercase; }
-.hero h1 { font-family:Manrope,sans-serif; font-size:clamp(2rem,4vw,3rem); line-height:1.12; letter-spacing:-.045em; margin:.55rem 0 .65rem; color:#172033; }
-.hero p { color:var(--muted); font-size:1.02rem; max-width:700px; margin:0; }
+.hero h1 { font-family:Manrope,sans-serif; font-size:clamp(1.9rem,3.1vw,2.45rem); line-height:1.08; letter-spacing:-.04em; margin:.35rem 0 .45rem; color:#172033; }
+.hero p { color:var(--muted); font-size:.92rem; max-width:700px; margin:0; }
 .section-card { padding:0; }
 .section-kicker { color:var(--accent); font-weight:700; font-size:.75rem; letter-spacing:.08em; text-transform:uppercase; }
-.section-title { font-family:Manrope,sans-serif; font-size:1.2rem; font-weight:800; margin:.35rem 0 .25rem; }
-.section-help { color:var(--muted); font-size:.88rem; margin-bottom:1rem; }
+.section-title { font-family:Manrope,sans-serif; font-size:1.08rem; font-weight:700; margin:.22rem 0 .2rem; }
+.section-help { color:var(--muted); font-size:.82rem; margin-bottom:.55rem; }
 div[data-testid="stFileUploader"] section { border:1.5px dashed #cbd0df; border-radius:13px; background:#fafbff; }
-div[data-testid="stTextInput"] input, div[data-testid="stSelectbox"] div[data-baseweb="select"] > div { border-radius:11px; background:#fafbff; }
+div[data-testid="stTextInput"] input, div[data-testid="stSelectbox"] div[data-baseweb="select"] > div { border-radius:8px; background:#fff; min-height:2.35rem; }\ndiv[data-testid="stTextInput"], div[data-testid="stSelectbox"], div[data-testid="stSlider"] { margin-bottom:.35rem; }\ndiv[data-testid="stFileUploader"] { margin-bottom:.35rem; }
 div.stButton > button[kind="primary"] { background:var(--accent); border:0; border-radius:8px; min-height:2.55rem; padding:.4rem 1rem; font-weight:600; box-shadow:none; }
 div.stButton > button[kind="primary"]:hover { background:#5148ed; border:0; }
 div.stButton > button { border-radius:8px; }
@@ -62,8 +62,8 @@ div.stButton > button { border-radius:8px; }
 div[data-testid="stExpander"] { border:1px solid var(--line); border-radius:12px; background:white; }
 .small-note { color:#8790a1; font-size:.78rem; }
 @media (max-width: 800px) {
- .block-container { padding:1rem 1rem 3rem; }
- .section-card { padding:1rem; }
+ .block-container { padding:.65rem 1rem 1.5rem; }
+ .section-card { padding:0; }
 }
 </style>
 """, unsafe_allow_html=True)
@@ -97,7 +97,7 @@ def clean_text(text: str) -> str:
 def make_documents(files) -> List[Document]:
     docs = []
     remaining_chars = 250_000
-    for file in files:
+    for source_index, file in enumerate(files):
         raw = clean_text(extract_text(file))
         if not raw:
             continue
@@ -106,7 +106,7 @@ def make_documents(files) -> List[Document]:
         remaining_chars -= len(raw)
         if remaining_chars < 0:
             remaining_chars = 0
-        docs.append(Document(page_content=raw, metadata={"source": file.name}))
+        docs.append(Document(page_content=raw, metadata={"source": file.name, "source_index": source_index}))
         if remaining_chars == 0:
             break
     if not docs:
@@ -116,8 +116,12 @@ def make_documents(files) -> List[Document]:
     )
     chunks = splitter.split_documents(docs)
     chunks = chunks[:300]
-    for i, chunk in enumerate(chunks):
-        chunk.metadata["chunk_id"] = i
+    per_source_counts = {}
+    for chunk in chunks:
+        source = chunk.metadata.get("source", "")
+        chunk_id = per_source_counts.get(source, 0)
+        chunk.metadata["chunk_id"] = chunk_id
+        per_source_counts[source] = chunk_id + 1
     return chunks
 
 
@@ -144,7 +148,16 @@ def retrieve_context(chunks, topic: str, k: int = RETRIEVAL_K):
         scored.append((score, -index, chunk))
     scored.sort(reverse=True, key=lambda item: (item[0], item[1]))
     matches = [item[2] for item in scored[:k] if item[0] > 0]
-    return matches or chunks[:min(k, len(chunks))]
+    selected = matches or chunks[:min(k, len(chunks))]
+    # Retrieval ranks by relevance; presentation/context order follows the source document.
+    return sorted(
+        selected,
+        key=lambda chunk: (
+            chunk.metadata.get("source_index", 0),
+            chunk.metadata.get("start_index", 0),
+            chunk.metadata.get("chunk_id", 0),
+        ),
+    )
 
 
 def build_gemini_llm():
@@ -327,6 +340,11 @@ def main():
             )
         else:
             st.caption("Text-based PDFs are supported. Scanned/image-only PDFs need OCR first.")
+        generate = st.button(
+            "Generate questions & answers",
+            type="primary",
+            disabled=not bool(files),
+        )
 
     with right:
         st.markdown('<div class="section-kicker">Step 02 · Interview setup</div>', unsafe_allow_html=True)
@@ -337,15 +355,6 @@ def main():
         difficulty = st.selectbox("Question difficulty", ["Beginner", "Intermediate", "Advanced"], index=1)
         count = st.select_slider("Number of questions", options=[3, 5, 7, 10], value=5)
 
-    st.write("")
-    _, action_col, _ = st.columns([1, 1.35, 1])
-    with action_col:
-        generate = st.button(
-            "Generate questions & answers",
-            type="primary",
-            use_container_width=False,
-            disabled=not bool(files),
-        )
     if not files:
         st.caption("Upload at least one source document to start generating.")
 
@@ -365,6 +374,19 @@ def main():
                     )
                     status.update(label="Your interview set is ready", state="complete", expanded=False)
                 st.session_state["results"] = results
+                st.session_state["all_chunks"] = [
+                    {
+                        "source": chunk.metadata.get("source", "document"),
+                        "source_index": chunk.metadata.get("source_index", 0),
+                        "chunk_id": chunk.metadata.get("chunk_id", 0),
+                        "text": chunk.page_content,
+                    }
+                    for chunk in chunks
+                ]
+                st.session_state["retrieved_chunk_keys"] = {
+                    (chunk.metadata.get("source", "document"), chunk.metadata.get("chunk_id", 0))
+                    for chunk in retrieved
+                }
                 st.session_state["run_meta"] = {
                     "files": [f.name for f in files],
                     "chunks": len(chunks),
@@ -406,21 +428,23 @@ def main():
                 if item.get("source_hint"):
                     st.markdown("**Why this question is relevant**")
                     st.caption(item["source_hint"])
-                sources = item.get("sources", [])
-                if sources:
-                    with st.expander("View retrieved source passages"):
-                        seen = set()
-                        for source in sources:
-                            key = (source["source"], source["chunk_id"])
-                            if key in seen:
-                                continue
-                            seen.add(key)
-                            st.markdown(f"**{source['source']} · Chunk {source['chunk_id']}**")
-                            st.write(source["text"])
             export.append(
                 f"## Question {idx}\n{item['question']}\n\n### Suggested answer\n{item['answer']}\n"
                 + (f"\n**Concept:** {item['concept']}\n" if item.get("concept") else "")
             )
+        all_chunks = st.session_state.get("all_chunks", [])
+        retrieved_keys = st.session_state.get("retrieved_chunk_keys", set())
+        if all_chunks:
+            with st.expander(f"Source document chunks · {len(all_chunks)} total", expanded=False):
+                st.caption("Chunks are displayed in original document order. Retrieved chunks are marked; other chunks were not selected for this generation.")
+                for chunk in all_chunks:
+                    key = (chunk["source"], chunk["chunk_id"])
+                    is_retrieved = key in retrieved_keys
+                    status = " · Retrieved" if is_retrieved else " · Not retrieved"
+                    st.markdown(f"**{chunk['source']} · Chunk {chunk['chunk_id']}{status}**")
+                    st.write(chunk["text"])
+                    st.divider()
+
         col_a, col_b = st.columns([1, 1])
         with col_a:
             st.download_button(
@@ -434,6 +458,8 @@ def main():
             if st.button("↻  Start a new practice set", use_container_width=True):
                 st.session_state.pop("results", None)
                 st.session_state.pop("run_meta", None)
+                st.session_state.pop("all_chunks", None)
+                st.session_state.pop("retrieved_chunk_keys", None)
                 st.rerun()
 
     st.divider()
