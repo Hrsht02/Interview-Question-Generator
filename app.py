@@ -194,7 +194,30 @@ def _extract_text(response) -> str:
     return "\n".join(pieces).strip()
 
 
+def _error_summary(exc: Exception, limit: int = 900) -> str:
+    """Return provider error details without logging request prompts or credentials."""
+    status = getattr(exc, "status_code", None)
+    message = " ".join(str(exc).split())
+    if status:
+        message = f"HTTP {status}: {message}"
+    return message[:limit] or type(exc).__name__
+
+
+def _is_quota_exhausted(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "resource_exhausted" in message
+        or "quota exceeded" in message
+        or "per day limit exceeded" in message
+        or "generate_content_free_tier_requests" in message
+    )
+
+
 def _is_transient(exc: Exception) -> bool:
+    # A 400/BadRequest is a permanent request/configuration error: retrying it
+    # cannot help. Retry only known temporary service/network failures.
+    if getattr(exc, "status_code", None) in (400, 401, 403, 404, 422):
+        return False
     message = str(exc).lower()
     return any(code in message for code in (
         "429", "500", "502", "503", "504", "rate_limit",
@@ -203,7 +226,7 @@ def _is_transient(exc: Exception) -> bool:
 
 
 def invoke_with_resilience(prompt: str) -> str:
-    """Grok is primary; Gemini is invoked as a fallback after bounded retries."""
+    """Use Grok first, then Gemini; log actionable provider errors without secrets."""
     grok_key = os.getenv("XAI_API_KEY", "").strip()
     primary_error = None
 
@@ -211,7 +234,7 @@ def invoke_with_resilience(prompt: str) -> str:
         client = OpenAI(
             api_key=grok_key,
             base_url="https://api.x.ai/v1",
-            timeout=90.0,
+            timeout=180.0,
             max_retries=0,
         )
         for attempt in range(MAX_RETRIES + 1):
@@ -229,17 +252,19 @@ def invoke_with_resilience(prompt: str) -> str:
             except Exception as exc:
                 primary_error = exc
                 logger.warning(
-                    "Grok primary request failed (attempt %s/%s): %s",
-                    attempt + 1, MAX_RETRIES + 1, type(exc).__name__,
+                    "Grok request failed (model=%s, attempt=%s/%s): %s",
+                    GROK_MODEL, attempt + 1, MAX_RETRIES + 1,
+                    _error_summary(exc),
                 )
                 if not _is_transient(exc) or attempt >= MAX_RETRIES:
                     break
                 time.sleep(1.0 * (2 ** attempt))
     else:
         primary_error = RuntimeError("XAI_API_KEY is missing.")
+        logger.error("Grok is not configured: XAI_API_KEY is missing.")
 
+    logger.info("Attempting Gemini fallback after Grok failure.")
     try:
-        logger.info("Attempting Gemini fallback after Grok primary failure.")
         response = build_gemini_llm().invoke(prompt)
         content = response.content
         if isinstance(content, list):
@@ -252,10 +277,23 @@ def invoke_with_resilience(prompt: str) -> str:
             raise RuntimeError("Gemini returned an empty response.")
         return generated
     except Exception as fallback_error:
-        logger.exception("Gemini fallback request failed")
+        fallback_summary = _error_summary(fallback_error)
+        logger.error("Gemini fallback failed: %s", fallback_summary)
+
+        if _is_quota_exhausted(fallback_error):
+            raise RuntimeError(
+                "Grok generation failed: "
+                + _error_summary(primary_error, 450)
+                + ". Gemini fallback is currently unavailable because its API quota "
+                "has been exhausted. Check Gemini usage/billing or wait for quota reset. "
+                "See https://ai.dev/rate-limit."
+            ) from fallback_error
+
         raise RuntimeError(
-            "Both Grok and Gemini generation attempts failed. Check Render logs, "
-            "provider API keys, model access, and available quota."
+            "Grok generation failed: "
+            + _error_summary(primary_error, 450)
+            + ". Gemini fallback also failed: "
+            + fallback_summary
         ) from fallback_error
 
 
