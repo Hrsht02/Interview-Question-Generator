@@ -54,7 +54,8 @@ header[data-testid="stHeader"] { background:rgba(251,252,255,.9); }
 .section-help { color:var(--muted); font-size:.82rem; margin-bottom:.55rem; }
 div[data-testid="stFileUploader"] section { border:1.5px dashed #cbd0df; border-radius:13px; background:#fafbff; }
 div[data-testid="stTextInput"] input, div[data-testid="stSelectbox"] div[data-baseweb="select"] > div { border-radius:8px; background:#fff; min-height:2.35rem; }
-div[data-testid="stTextInput"], div[data-testid="stSelectbox"], div[data-testid="stSlider"] { margin-bottom:.35rem; }\ndiv[data-testid="stFileUploader"] { margin-bottom:.35rem; }
+div[data-testid="stTextInput"], div[data-testid="stSelectbox"], div[data-testid="stSlider"] { margin-bottom:.35rem; }
+div[data-testid="stFileUploader"] { margin-bottom:.35rem; }
 div.stButton > button[kind="primary"] { background:var(--accent); border:0; border-radius:8px; min-height:2.55rem; padding:.4rem 1rem; font-weight:600; box-shadow:none; }
 div.stButton > button[kind="primary"]:hover { background:#5148ed; border:0; }
 div.stButton > button { border-radius:8px; }
