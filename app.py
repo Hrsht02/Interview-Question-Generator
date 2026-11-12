@@ -4,7 +4,6 @@ import json
 import os
 import re
 import time
-from collections import Counter
 from typing import Dict, List
 
 import streamlit as st
@@ -12,6 +11,8 @@ from dotenv import load_dotenv
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 from langchain_core.documents import Document
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from openai import OpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -126,33 +127,29 @@ def make_documents(files) -> List[Document]:
     return chunks
 
 
-def retrieve_context(chunks, topic: str, k: int = RETRIEVAL_K):
-    """Keep the existing lightweight lexical RAG retrieval and ranking strategy."""
-    stop_words = {
-        "the", "and", "for", "with", "that", "this", "from", "into", "are", "was",
-        "were", "you", "your", "what", "when", "where", "which", "how", "why",
-        "about", "using", "use", "can", "could", "should", "would", "have", "has",
-        "had", "not", "but", "all", "any", "its", "their", "they", "them", "then",
-        "than", "also", "each", "such", "these", "those", "our", "out", "more"
-    }
-    terms = [
-        t for t in re.findall(r"[a-zA-Z0-9_+#.-]{2,}", (topic or "").lower())
-        if t not in stop_words
-    ]
-    if not terms:
-        return chunks[:min(k, len(chunks))]
-    scored = []
-    for index, chunk in enumerate(chunks):
-        words = re.findall(r"[a-zA-Z0-9_+#.-]{2,}", chunk.page_content.lower())
-        counts = Counter(words)
-        score = sum(min(counts.get(term, 0), 4) for term in terms)
-        scored.append((score, -index, chunk))
-    scored.sort(reverse=True, key=lambda item: (item[0], item[1]))
-    matches = [item[2] for item in scored[:k] if item[0] > 0]
-    selected = matches or chunks[:min(k, len(chunks))]
-    # Retrieval ranks by relevance; presentation/context order follows the source document.
+def build_vector_store(chunks):
+    """Create an in-memory FAISS index using Gemini text embeddings."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is required for document embeddings and Gemini fallback. "
+            "Add it in Render Environment."
+        )
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model=os.getenv("EMBEDDING_MODEL", "gemini-embedding-001").strip(),
+        google_api_key=api_key,
+    )
+    return FAISS.from_documents(chunks, embeddings)
+
+
+def retrieve_context(vector_store, topic: str, role: str, k: int = RETRIEVAL_K):
+    """Retrieve semantically relevant chunks with FAISS similarity search."""
+    query = " ".join(part for part in [topic.strip(), role.strip()] if part)
+    if not query:
+        query = "Core concepts, practical knowledge, and interview topics in the uploaded documents"
+    matches = vector_store.similarity_search(query, k=k)
     return sorted(
-        selected,
+        matches,
         key=lambda chunk: (
             chunk.metadata.get("source_index", 0),
             chunk.metadata.get("start_index", 0),
@@ -264,51 +261,87 @@ def parse_json_array(raw: str):
 
 
 def generate_interview_set(chunks, topic: str, role: str, difficulty: str, count: int):
-    """One model round-trip creates the questions and their answers to reduce latency."""
+    """Two-stage generation: first create questions, then generate grounded answers."""
     context = "\n\n".join(
         f"[Source: {d.metadata.get('source', 'document')} | chunk {d.metadata.get('chunk_id', '?')}]\n"
         f"{d.page_content}"
         for d in chunks
     )
-    prompt = f"""
-You are an expert technical interviewer and interview coach.
-Create exactly {count} distinct, useful interview question-and-answer pairs.
-Topic/focus: {topic or "Choose the most relevant topics in the source"}
+
+    question_prompt = f"""
+You are an expert technical interviewer.
+Generate exactly {count} distinct interview questions.
+Topic/focus: {topic or "Relevant topics from the uploaded material"}
 Target role: {role or "General technical role"}
 Difficulty: {difficulty}
 
-Use the retrieved source passages as the primary source of truth.
-Questions must be grounded in the passages or clearly test a directly related concept.
-Avoid duplicates. Cover different concepts. Do not claim the source says something it does not.
-Answers should be interview-ready: direct opening, clear explanation, and a concise example
-where useful. If the source is insufficient, say what is missing instead of fabricating.
-Return ONLY a valid JSON array. Every object must contain:
-"question", "concept", "answer", "source_hint".
+Use the retrieved source context as the factual basis. Questions should test understanding
+and practical application, fit the target role, and avoid duplicates.
+Return ONLY a valid JSON array of objects with fields "question", "concept", "source_hint".
+Do not include answers in this stage. No markdown fences or surrounding commentary.
+
+RETRIEVED SOURCE CONTEXT:
+{context}
+"""
+    question_items = parse_json_array(invoke_with_resilience(question_prompt))
+    questions = [
+        {
+            "question": str(item.get("question", "")).strip(),
+            "concept": str(item.get("concept", "")).strip(),
+            "source_hint": str(item.get("source_hint", "")).strip(),
+        }
+        for item in question_items
+        if isinstance(item, dict) and item.get("question")
+    ][:count]
+    if not questions:
+        raise ValueError("The question-generation stage returned no usable questions.")
+
+    answer_prompt = f"""
+You are an expert technical interview coach.
+Write an accurate, interview-ready answer for each question below.
+Target role: {role or "General technical role"}
+Difficulty: {difficulty}
+
+Use the retrieved context as the primary source of truth. Explain clearly and add a concise
+practical example where useful. Do not invent facts absent from the context. If the context
+is insufficient, state that explicitly. Keep each question text unchanged.
+
+QUESTIONS:
+{json.dumps(questions, ensure_ascii=False)}
+
+Return ONLY a valid JSON array with one object per question and fields "question", "answer".
 No markdown fences and no text outside the JSON array.
 
 RETRIEVED SOURCE CONTEXT:
 {context}
 """
-    parsed = parse_json_array(invoke_with_resilience(prompt))
+    answer_items = parse_json_array(invoke_with_resilience(answer_prompt))
+    answers_by_question = {
+        str(item.get("question", "")).strip(): str(item.get("answer", "")).strip()
+        for item in answer_items
+        if isinstance(item, dict) and item.get("question") and item.get("answer")
+    }
+
     results = []
-    for item in parsed:
-        if not isinstance(item, dict) or not item.get("question") or not item.get("answer"):
-            continue
-        results.append({
-            "question": str(item["question"]).strip(),
-            "concept": str(item.get("concept", "")).strip(),
-            "answer": str(item["answer"]).strip(),
-            "source_hint": str(item.get("source_hint", "")).strip(),
-            "sources": [
-                {
-                    "source": d.metadata.get("source", "document"),
-                    "chunk_id": d.metadata.get("chunk_id", "?"),
-                    "text": d.page_content,
-                } for d in chunks
-            ],
-        })
+    for index, item in enumerate(questions):
+        answer = answers_by_question.get(item["question"])
+        if not answer and index < len(answer_items) and isinstance(answer_items[index], dict):
+            answer = str(answer_items[index].get("answer", "")).strip()
+        if answer:
+            results.append({
+                **item,
+                "answer": answer,
+                "sources": [
+                    {
+                        "source": doc.metadata.get("source", "document"),
+                        "chunk_id": doc.metadata.get("chunk_id", "?"),
+                        "text": doc.page_content,
+                    }
+                    for doc in chunks
+                ],
+            })
     if not results:
-        raise ValueError("No complete question-and-answer pairs were returned. Please retry.")
+        raise ValueError("The answer-generation stage returned no usable answers.")
     return results[:count]
 
 
@@ -351,7 +384,7 @@ def main():
     with right:
         st.markdown('<div class="section-kicker">Step 02 · Interview setup</div>', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Personalise your practice</div>', unsafe_allow_html=True)
-        st.markdown('<div class="section-help">Choose what you are preparing for. Retrieval settings are optimised automatically.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-help">Choose your focus. FAISS semantic search finds the most relevant passages.</div>', unsafe_allow_html=True)
         topic = st.text_input("Topic or focus", placeholder="e.g. Python, SQL, RAG, system design")
         role = st.text_input("Target role", placeholder="e.g. Data Analyst, GenAI Developer")
         difficulty = st.selectbox("Question difficulty", ["Beginner", "Intermediate", "Advanced"], index=1)
@@ -368,9 +401,12 @@ def main():
                 with st.status("Preparing your interview set…", expanded=True) as status:
                     st.write("Extracting text and building source chunks")
                     chunks = make_documents(files)
-                    st.write(f"Retrieving the most relevant passages from {len(chunks)} chunks")
-                    retrieved = retrieve_context(chunks, topic, RETRIEVAL_K)
-                    st.write("Generating questions and answers")
+                    st.write("Creating Gemini embeddings and building the FAISS index")
+                    vector_store = build_vector_store(chunks)
+                    st.write(f"Running semantic search across {len(chunks)} chunks")
+                    retrieved = retrieve_context(vector_store, topic, role, RETRIEVAL_K)
+                    st.write("Stage 1/2 · Generating interview questions")
+                    st.write("Stage 2/2 · Generating grounded answers")
                     results = generate_interview_set(
                         retrieved, topic, role, difficulty, int(count)
                     )
