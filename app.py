@@ -333,9 +333,10 @@ def main():
             label_visibility="collapsed",
         )
         if files:
-            total_mb = sum(f.size for f in files) / (1024 * 1024)
+            total_bytes = sum(f.size for f in files)
+            size_label = f"{total_bytes / 1024:.0f} KB" if total_bytes < 1024 * 1024 else f"{total_bytes / (1024 * 1024):.1f} MB"
             st.markdown(
-                f'<div class="metric-strip">✓ {len(files)} file(s) ready · {total_mb:.1f} MB uploaded</div>',
+                f'<div class="metric-strip">✓ {len(files)} file(s) ready · {size_label} uploaded</div>',
                 unsafe_allow_html=True,
             )
         else:
