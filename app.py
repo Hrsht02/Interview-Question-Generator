@@ -195,7 +195,7 @@ def invoke_with_resilience(prompt: str) -> str:
         )
         for attempt in range(MAX_RETRIES + 1):
             try:
-                response = client.responses.create(model=GROK_MODEL, input=prompt)
+                response = client.responses.create(\n                    model=GROK_MODEL,\n                    input=prompt,\n                    reasoning={"effort": "low"},\n                    store=False,\n                )
                 generated = _extract_text(response)
                 if not generated:
                     raise RuntimeError("Grok returned an empty response.")
