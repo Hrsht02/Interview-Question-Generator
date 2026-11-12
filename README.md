@@ -1,39 +1,62 @@
-# LLM-Based Interview Question Generator
+# Prepwise — Interview Question Generator
 
-A document-grounded interview question and answer generator built with Python, Streamlit, LangChain's text splitter, and the Gemini API. No login system is included.
+A document-grounded interview preparation app built with Streamlit, LangChain text splitting, lightweight lexical retrieval, and Gemini. Upload your own learning material and generate role-focused interview questions with suggested answers.
 
-## Features
-- Upload PDF, DOCX, TXT, or Markdown source material
-- Text extraction, cleaning, and overlapping chunking
-- Lightweight local keyword-based retrieval (no local neural embedding model)
-- Gemini-powered interview question generation and answer drafting
-- Adjustable question count, difficulty, topic, and target role
-- Source chunk references and Markdown download
+## What it does
+- Accepts PDF, DOCX, TXT, and Markdown source material.
+- Extracts and cleans text, then creates overlapping chunks.
+- Uses lightweight local keyword ranking to retrieve relevant chunks (no embedding model or vector database required).
+- Generates questions and answers grounded in the retrieved passages.
+- Shows source passages and supports Markdown export.
+- Keeps provider credentials and model configuration on the server; they are never entered in the UI.
 
-## Setup
-1. Install Python 3.10 or newer.
-2. Create and activate a virtual environment.
-3. Install dependencies: `pip install -r requirements.txt`
-4. Copy `.env.example` to `.env` and set `GEMINI_API_KEY` from Google AI Studio.
-5. Run locally: `streamlit run app.py`
+## RAG pipeline
 
-## Render deployment
-The repository includes `render.yaml`. Connect the repository to Render as a web service and set `GEMINI_API_KEY` in the service's environment variables. The start command must be:
-
-```bash
-streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
+```text
+Upload documents
+      ↓
+Text extraction (PDF / DOCX / TXT / MD)
+      ↓
+Text cleaning
+      ↓
+Recursive chunking (700 chars, 80 overlap)
+      ↓
+Lightweight lexical retrieval (top 5 chunks)
+      ↓
+Gemini generates questions + answers in one request
+      ↓
+Source-backed results + Markdown export
 ```
 
-The app deliberately avoids loading local sentence-transformer models and creating an in-memory Chroma index, which can exceed the 512 MB memory limit on small instances. Retrieval is lightweight and local; Gemini is used for generation. Large document sets are capped at 300 chunks per run to limit memory use.
+The retrieval architecture remains deliberately lightweight for Render's small instances. The latency improvement comes from combining question and answer generation into a single model request instead of making one request for questions followed by a separate sequential request for every answer.
 
-## Storage and privacy
-No SQL database is required for the current design: there are no user accounts and uploaded files/results are session-based rather than persistent. The app does not intentionally store uploaded documents in a database. Relevant document text is sent to Gemini as part of generation prompts, so do not upload confidential material unless you are comfortable sharing it with the API provider.
+## Local setup
+1. Use Python 3.10 or newer.
+2. Create and activate a virtual environment.
+3. Install dependencies: `pip install -r requirements.txt`.
+4. Copy `.env.example` to `.env` and set your Gemini API key.
+5. Run: `streamlit run app.py`.
 
-## Environment variables
-- `GEMINI_API_KEY` — required for generation
-- `GEMINI_MODEL` — optional; must be available to your Gemini API project (default: `gemini-2.5-flash`)
+## Render deployment
+Connect this repository to Render as a Python web service. The included `render.yaml` contains the build and start commands.
 
-## Pipeline
-Upload → text extraction → chunking → lightweight keyword ranking → Gemini question generation → Gemini answer generation → display and Markdown export.
+In **Render → your service → Environment**, set:
+- `GEMINI_API_KEY` — required secret from Google AI Studio.
+- `GEMINI_MODEL` — optional; defaults to `gemini-2.5-flash`.
+- `GEMINI_FALLBACK_MODEL` — optional fallback model name from your Gemini project, used only if the primary model encounters a temporary capacity/rate-limit error.
 
-Generated content can be inaccurate; review answers before relying on them.
+Save the environment variables and trigger a redeploy. The API key and model are intentionally not exposed in the app interface.
+
+## Reliability and performance
+- Transient Gemini 429/500/503 errors receive bounded exponential-backoff retries.
+- An optional fallback model can be configured for provider capacity issues.
+- Question and answer generation happen in one model round-trip to reduce latency.
+- Generation requests use a bounded timeout.
+- Uploads are limited to 20 MB per file; extracted text is capped at 250,000 characters and processing is capped at 300 chunks.
+
+A provider-side outage or exhausted quota cannot be eliminated by application code. If the provider remains unavailable after retries and fallback, the app shows a concise actionable message rather than a raw stack trace.
+
+## Privacy
+There is no login system or persistent document database. Uploaded files are processed for the active Streamlit session. Retrieved text is sent to the configured Gemini API as part of the generation prompt. Do not upload confidential material unless you are comfortable sharing it with the provider.
+
+Generated answers may contain mistakes; verify them before relying on them in an interview.
