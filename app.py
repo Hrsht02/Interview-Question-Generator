@@ -13,6 +13,7 @@ from pypdf import PdfReader
 from docx import Document as DocxDocument
 from langchain_core.documents import Document
 from langchain_google_genai import ChatGoogleGenerativeAI
+from openai import OpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 load_dotenv()
@@ -24,8 +25,8 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.7").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 RETRIEVAL_K = 5
 MAX_UPLOAD_MB = 20
 MAX_RETRIES = 2
@@ -45,16 +46,16 @@ header[data-testid="stHeader"] { background:rgba(251,252,255,.9); }
 .eyebrow { color:var(--accent); font-size:.76rem; font-weight:700; letter-spacing:.12em; text-transform:uppercase; }
 .hero h1 { font-family:Manrope,sans-serif; font-size:clamp(2rem,4vw,3rem); line-height:1.12; letter-spacing:-.045em; margin:.55rem 0 .65rem; color:#172033; }
 .hero p { color:var(--muted); font-size:1.02rem; max-width:700px; margin:0; }
-.section-card { background:white; border:1px solid var(--line); border-radius:18px; padding:1.25rem 1.35rem; min-height:100%; box-shadow:0 5px 22px rgba(24,35,58,.035); }
+.section-card { padding:0; }
 .section-kicker { color:var(--accent); font-weight:700; font-size:.75rem; letter-spacing:.08em; text-transform:uppercase; }
 .section-title { font-family:Manrope,sans-serif; font-size:1.2rem; font-weight:800; margin:.35rem 0 .25rem; }
 .section-help { color:var(--muted); font-size:.88rem; margin-bottom:1rem; }
 div[data-testid="stFileUploader"] section { border:1.5px dashed #cbd0df; border-radius:13px; background:#fafbff; }
 div[data-testid="stTextInput"] input, div[data-testid="stSelectbox"] div[data-baseweb="select"] > div { border-radius:11px; background:#fafbff; }
-div.stButton > button[kind="primary"] { background:var(--accent); border:0; border-radius:12px; min-height:3.2rem; font-weight:700; box-shadow:0 7px 18px rgba(99,91,255,.2); }
+div.stButton > button[kind="primary"] { background:var(--accent); border:0; border-radius:8px; min-height:2.55rem; padding:.4rem 1rem; font-weight:600; box-shadow:none; }
 div.stButton > button[kind="primary"]:hover { background:#5148ed; border:0; }
-div.stButton > button { border-radius:10px; }
-.metric-strip { background:#f1f2ff; border:1px solid #e5e5ff; border-radius:13px; padding:.8rem 1rem; color:#4441a5; font-size:.9rem; }
+div.stButton > button { border-radius:8px; }
+.metric-strip { background:#f4f5f8; border:1px solid #e7e9ef; border-radius:8px; padding:.65rem .8rem; color:#465064; font-size:.88rem; }
 .result-head { font-family:Manrope,sans-serif; font-size:1.55rem; font-weight:800; letter-spacing:-.025em; }
 .question-card { background:white; border:1px solid var(--line); border-radius:14px; padding:1rem 1.1rem; margin:.65rem 0; }
 .answer-label { color:var(--accent); font-weight:700; font-size:.76rem; text-transform:uppercase; letter-spacing:.08em; }
@@ -146,62 +147,90 @@ def retrieve_context(chunks, topic: str, k: int = RETRIEVAL_K):
     return matches or chunks[:min(k, len(chunks))]
 
 
-def build_llm(model_name: str):
+def build_gemini_llm():
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError(
-            "The generation service is not configured yet. Add GEMINI_API_KEY "
-            "to the Render service environment variables, then redeploy."
-        )
+        raise RuntimeError("Gemini fallback is not configured. Add GEMINI_API_KEY in Render.")
     return ChatGoogleGenerativeAI(
-        model=model_name,
+        model=GEMINI_MODEL,
         google_api_key=api_key,
         temperature=0.2,
         max_retries=0,
-        timeout=45,
+        timeout=60,
     )
 
 
+def _extract_text(response) -> str:
+    text = getattr(response, "output_text", None)
+    if text:
+        return str(text).strip()
+    pieces = []
+    for item in getattr(response, "output", []) or []:
+        for content in getattr(item, "content", []) or []:
+            value = getattr(content, "text", None)
+            if value:
+                pieces.append(value)
+    return "\n".join(pieces).strip()
+
+
+def _is_transient(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(code in message for code in (
+        "429", "500", "502", "503", "504", "rate_limit",
+        "overloaded", "temporarily", "timeout", "connection"
+    ))
+
+
 def invoke_with_resilience(prompt: str) -> str:
-    """Retry transient provider failures, then optionally try a configured fallback model."""
-    models = [MODEL_NAME]
-    if FALLBACK_MODEL and FALLBACK_MODEL != MODEL_NAME:
-        models.append(FALLBACK_MODEL)
-    last_error = None
-    for model in models:
-        llm = build_llm(model)
+    """Grok is primary; Gemini is invoked as a fallback after bounded retries."""
+    grok_key = os.getenv("XAI_API_KEY", "").strip()
+    primary_error = None
+
+    if grok_key:
+        client = OpenAI(
+            api_key=grok_key,
+            base_url="https://api.x.ai/v1",
+            timeout=90.0,
+            max_retries=0,
+        )
         for attempt in range(MAX_RETRIES + 1):
             try:
-                response = llm.invoke(prompt)
-                content = response.content
-                if isinstance(content, list):
-                    content = "\n".join(
-                        part.get("text", "") if isinstance(part, dict) else str(part)
-                        for part in content
-                    )
-                return str(content).strip()
+                response = client.responses.create(model=GROK_MODEL, input=prompt)
+                generated = _extract_text(response)
+                if not generated:
+                    raise RuntimeError("Grok returned an empty response.")
+                return generated
             except Exception as exc:
-                last_error = exc
-                message = str(exc).lower()
-                transient = any(code in message for code in (
-                    "503", "unavailable", "429", "resource_exhausted",
-                    "500", "internal", "temporarily", "overloaded"
-                ))
-                if not transient or attempt >= MAX_RETRIES:
+                primary_error = exc
+                logger.warning(
+                    "Grok primary request failed (attempt %s/%s): %s",
+                    attempt + 1, MAX_RETRIES + 1, type(exc).__name__,
+                )
+                if not _is_transient(exc) or attempt >= MAX_RETRIES:
                     break
-                time.sleep(1.2 * (2 ** attempt))
-    message = str(last_error or "Unknown provider error").lower()
-    if any(code in message for code in ("503", "unavailable", "429", "resource_exhausted", "overloaded")):
+                time.sleep(1.0 * (2 ** attempt))
+    else:
+        primary_error = RuntimeError("XAI_API_KEY is missing.")
+
+    try:
+        logger.info("Attempting Gemini fallback after Grok primary failure.")
+        response = build_gemini_llm().invoke(prompt)
+        content = response.content
+        if isinstance(content, list):
+            content = "\n".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        generated = str(content).strip()
+        if not generated:
+            raise RuntimeError("Gemini returned an empty response.")
+        return generated
+    except Exception as fallback_error:
+        logger.exception("Gemini fallback request failed")
         raise RuntimeError(
-            "The AI provider is temporarily busy. Please retry in a moment. "
-            "If this happens repeatedly, configure GEMINI_FALLBACK_MODEL in Render."
-        ) from last_error
-    if "401" in message or "403" in message or "api key" in message or "permission" in message:
-        raise RuntimeError(
-            "The AI provider rejected the server credentials. Verify GEMINI_API_KEY "
-            "in Render Environment and redeploy."
-        ) from last_error
-    raise RuntimeError("Generation could not be completed. Please try again.") from last_error
+            "Both Grok and Gemini generation attempts failed. Check Render logs, "
+            "provider API keys, model access, and available quota."
+        ) from fallback_error
 
 
 def parse_json_array(raw: str):
@@ -276,7 +305,6 @@ def main():
 
     left, right = st.columns([1.08, 0.92], gap="large")
     with left:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-kicker">Step 01 · Your material</div>', unsafe_allow_html=True)
         st.markdown('<div class="section-title">Add source documents</div>', unsafe_allow_html=True)
         st.markdown('<div class="section-help">Use class notes, technical documentation, PDFs, or your own study material.</div>', unsafe_allow_html=True)
@@ -294,7 +322,6 @@ def main():
             )
         else:
             st.caption("Text-based PDFs are supported. Scanned/image-only PDFs need OCR first.")
-        st.markdown('</div>', unsafe_allow_html=True)
 
     with right:
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
@@ -308,12 +335,14 @@ def main():
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.write("")
-    generate = st.button(
-        "✦  Generate interview questions & answers",
-        type="primary",
-        use_container_width=True,
-        disabled=not bool(files),
-    )
+    _, action_col, _ = st.columns([1, 1.35, 1])
+    with action_col:
+        generate = st.button(
+            "Generate questions & answers",
+            type="primary",
+            use_container_width=False,
+            disabled=not bool(files),
+        )
     if not files:
         st.caption("Upload at least one source document to start generating.")
 
@@ -407,7 +436,7 @@ def main():
     st.divider()
     st.markdown(
         '<div class="small-note">Privacy & accuracy · Documents are processed for this session. '
-        'Relevant text is sent to the configured AI provider to generate answers. '
+        'Relevant text is sent to Grok, with Gemini as an automatic fallback, to generate answers. '
         'Review generated answers before using them in an interview.</div>',
         unsafe_allow_html=True,
     )
