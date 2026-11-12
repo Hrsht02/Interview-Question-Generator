@@ -135,19 +135,27 @@ def build_vector_store(chunks):
             "GEMINI_API_KEY is required for document embeddings and Gemini fallback. "
             "Add it in Render Environment."
         )
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model=os.getenv("EMBEDDING_MODEL", "gemini-embedding-001").strip(),
+    model = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001").strip()
+    document_embeddings = GoogleGenerativeAIEmbeddings(
+        model=model,
         google_api_key=api_key,
+        task_type="RETRIEVAL_DOCUMENT",
     )
-    return FAISS.from_documents(chunks, embeddings)
+    query_embeddings = GoogleGenerativeAIEmbeddings(
+        model=model,
+        google_api_key=api_key,
+        task_type="RETRIEVAL_QUERY",
+    )
+    return FAISS.from_documents(chunks, document_embeddings), query_embeddings
 
 
-def retrieve_context(vector_store, topic: str, role: str, k: int = RETRIEVAL_K):
+def retrieve_context(vector_store, query_embeddings, topic: str, role: str, k: int = RETRIEVAL_K):
     """Retrieve semantically relevant chunks with FAISS similarity search."""
     query = " ".join(part for part in [topic.strip(), role.strip()] if part)
     if not query:
         query = "Core concepts, practical knowledge, and interview topics in the uploaded documents"
-    matches = vector_store.similarity_search(query, k=k)
+    query_vector = query_embeddings.embed_query(query)
+    matches = vector_store.similarity_search_by_vector(query_vector, k=k)
     return sorted(
         matches,
         key=lambda chunk: (
@@ -260,7 +268,7 @@ def parse_json_array(raw: str):
     return data
 
 
-def generate_interview_set(chunks, topic: str, role: str, difficulty: str, count: int):
+def generate_interview_set(chunks, topic: str, role: str, difficulty: str, count: int, progress_callback=None):
     """Two-stage generation: first create questions, then generate grounded answers."""
     context = "\n\n".join(
         f"[Source: {d.metadata.get('source', 'document')} | chunk {d.metadata.get('chunk_id', '?')}]\n"
@@ -268,6 +276,8 @@ def generate_interview_set(chunks, topic: str, role: str, difficulty: str, count
         for d in chunks
     )
 
+    if progress_callback:
+        progress_callback("Stage 1/2 · Generating interview questions")
     question_prompt = f"""
 You are an expert technical interviewer.
 Generate exactly {count} distinct interview questions.
@@ -296,6 +306,8 @@ RETRIEVED SOURCE CONTEXT:
     if not questions:
         raise ValueError("The question-generation stage returned no usable questions.")
 
+    if progress_callback:
+        progress_callback("Stage 2/2 · Generating grounded answers")
     answer_prompt = f"""
 You are an expert technical interview coach.
 Write an accurate, interview-ready answer for each question below.
@@ -402,13 +414,14 @@ def main():
                     st.write("Extracting text and building source chunks")
                     chunks = make_documents(files)
                     st.write("Creating Gemini embeddings and building the FAISS index")
-                    vector_store = build_vector_store(chunks)
-                    st.write(f"Running semantic search across {len(chunks)} chunks")
-                    retrieved = retrieve_context(vector_store, topic, role, RETRIEVAL_K)
-                    st.write("Stage 1/2 · Generating interview questions")
-                    st.write("Stage 2/2 · Generating grounded answers")
+                    vector_store, query_embeddings = build_vector_store(chunks)
+                    st.write(f"Running FAISS semantic search across {len(chunks)} chunks")
+                    retrieved = retrieve_context(
+                        vector_store, query_embeddings, topic, role, RETRIEVAL_K
+                    )
                     results = generate_interview_set(
-                        retrieved, topic, role, difficulty, int(count)
+                        retrieved, topic, role, difficulty, int(count),
+                        progress_callback=status.write,
                     )
                     status.update(label="Your interview set is ready", state="complete", expanded=False)
                 st.session_state["results"] = results
@@ -502,9 +515,8 @@ def main():
 
     st.divider()
     st.markdown(
-        '<div class="small-note">Privacy & accuracy · Documents are processed for this session. '
-        'Relevant text is sent to Grok, with Gemini as an automatic fallback, to generate answers. '
-        'Review generated answers before using them in an interview.</div>',
+        '<div class="small-note"><strong>How it works:</strong> Document extraction → Recursive chunking → Gemini embeddings → FAISS semantic search → Question prompt → Answer prompt → Interview-ready Q&A</div>'
+        '<div class="small-note">Gemini creates embeddings · Grok generates questions and answers, with Gemini fallback · Documents and FAISS index are processed in memory for this session.</div>',
         unsafe_allow_html=True,
     )
 
