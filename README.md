@@ -1,6 +1,6 @@
 # Prepwise — Interview Question Generator
 
-A document-grounded interview preparation application built with Streamlit, LangChain, FAISS, Gemini embeddings, Grok, and Gemini fallback.
+A document-grounded interview preparation application built with Streamlit, LangChain, FAISS, Gemini embeddings, Groq, and Gemini fallback.
 
 ## Implemented architecture
 
@@ -33,10 +33,10 @@ FAISS is the vector store actually used by the application. ChromaDB is not curr
 The question set is generated in one model call. The answer Refine chain makes one initial call plus one refinement call per additional retrieved passage. With five retrieved passages, this is one question-generation call and up to five answer-generation/refinement calls. Batching all questions in each pass avoids making a separate call for every question.
 
 ## Model routing
-- Primary generation provider: Grok through the xAI Responses API.
+- Primary generation provider: GroqCloud through the Groq Responses API.
 - Generation fallback: Gemini (gemini-2.5-flash) is attempted when Grok fails.
 - Embedding provider: Gemini Embeddings. This is used for document and query vectors even when Grok handles text generation.
-- Transient Grok failures receive bounded retries. If Grok still fails, the same generation step falls back to Gemini.
+- Transient Groq failures receive bounded retries. If Groq still fails, the same generation step falls back to Gemini.
 - Malformed JSON receives one format-correction attempt.
 
 ## Render environment variables
@@ -45,8 +45,8 @@ Set these in Render → Service → Environment:
 
 | Variable | Value |
 |---|---|
-| XAI_API_KEY | Your xAI API key |
-| GROK_MODEL | grok-4.7 |
+| GROQ_API_KEY | Your GroqCloud API key (starts with `gsk_`) |
+| GROQ_MODEL | openai/gpt-oss-120b |
 | GEMINI_API_KEY | Google Gemini API key (required for embeddings and fallback) |
 | GEMINI_MODEL | gemini-2.5-flash |
 | EMBEDDING_MODEL | gemini-embedding-001 |
@@ -63,7 +63,7 @@ Save environment variables and redeploy the Render service. API keys are never r
 ## Runtime and privacy
 - Uploaded files, extracted chunks, and the FAISS index are held in memory for the active generation run; no persistent vector database is configured.
 - Document text is sent to Google's embedding API to create vectors.
-- Retrieved text is sent to Grok, or Gemini when generation fallback is used.
+- Retrieved text is sent to Groq, or Gemini when generation fallback is used.
 - Uploads are limited to 20 MB per file; extracted text is capped at 250,000 characters and chunk processing at 300 chunks.
 - The Refine chain improves coverage across retrieved passages but adds sequential model calls; actual latency depends on provider response times and quota.
 - Generated answers may contain mistakes; verify them before relying on them in an interview.
