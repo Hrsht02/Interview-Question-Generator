@@ -2,71 +2,68 @@
 
 A document-grounded interview preparation application built with Streamlit, LangChain, FAISS, Gemini embeddings, Grok, and Gemini fallback.
 
-## Features
-- Upload PDF, DOCX, TXT, or Markdown source material.
-- Extract and clean document text, then split it into overlapping chunks.
-- Generate text embeddings with Google's `gemini-embedding-001` model.
-- Store chunk vectors in an in-memory FAISS index and retrieve the top 5 semantically relevant passages.
-- Generate interview questions and answers in two distinct LLM stages.
-- Grok is the primary generation provider; Gemini is the automatic fallback.
-- Display source chunks in document order and export interview sets as Markdown.
-- Provider credentials are configured server-side and never shown in the UI.
+## Implemented architecture
 
-## RAG and generation pipeline
+Document upload (PDF / DOCX / TXT / Markdown)
+→ Text extraction and cleaning
+→ RecursiveCharacterTextSplitter (700-character chunks, 80-character overlap)
+→ Gemini Embeddings (gemini-embedding-001)
+→ FAISS in-memory vector index
+→ Semantic similarity retrieval (top 5 passages)
+→ Stage 1: question-generation prompt
+→ Stage 2: answer generation with a sequential Refine chain
+→ Initial answer from first retrieved passage
+→ Sequential refinement using each remaining passage
+→ Final interview Q&A with source attribution
 
-```text
-Document upload (PDF / DOCX / TXT / MD)
-        ↓
-Text extraction and cleaning
-        ↓
-Recursive chunking (700 characters, 80 overlap)
-        ↓
-Gemini Embeddings (gemini-embedding-001)
-        ↓
-FAISS vector index (in-memory)
-        ↓
-Semantic similarity search (top 5 chunks)
-        ↓
-Prompt 1 — Generate interview questions
-        ↓
-Prompt 2 — Generate answers for those questions
-        ↓
-Grok primary · Gemini fallback for each generation stage
-        ↓
-Interview-ready Q&A with source context
-```
+## Retrieval and embeddings
+- Chunking: LangChain RecursiveCharacterTextSplitter, 700 characters with 80-character overlap.
+- Embedding model: Google gemini-embedding-001.
+- Vector index: FAISS via LangChain Community FAISS.
+- Document embeddings use the RETRIEVAL_DOCUMENT task type.
+- Query embeddings use the RETRIEVAL_QUERY task type.
+- Retrieval: FAISS vector similarity search; top 5 passages are selected and restored to source-document order before the Refine chain.
 
-FAISS is the vector index. Gemini generates the embeddings. The index is created in memory for each generation run and is not persisted to disk or a hosted vector database.
+FAISS is the vector store actually used by the application. ChromaDB is not currently part of the runtime architecture; do not list ChromaDB as an implemented technology on the resume unless it is added separately.
+
+## Two-stage generation and Refine chain
+1. Question generation: one prompt generates the requested set of role- and difficulty-specific questions from all retrieved passages.
+2. Answer generation: a custom sequential LangChain-prompt Refine chain generates an initial batch of answers from the first retrieved passage, then refines that complete answer batch with each subsequent passage. Existing supported information is retained and new supported evidence is incorporated. Each answer is matched using a stable question ID.
+
+The question set is generated in one model call. The answer Refine chain makes one initial call plus one refinement call per additional retrieved passage. With five retrieved passages, this is one question-generation call and up to five answer-generation/refinement calls. Batching all questions in each pass avoids making a separate call for every question.
+
+## Model routing
+- Primary generation provider: Grok through the xAI Responses API.
+- Generation fallback: Gemini (gemini-2.5-flash) is attempted when Grok fails.
+- Embedding provider: Gemini Embeddings. This is used for document and query vectors even when Grok handles text generation.
+- Transient Grok failures receive bounded retries. If Grok still fails, the same generation step falls back to Gemini.
+- Malformed JSON receives one format-correction attempt.
 
 ## Render environment variables
 
+Set these in Render → Service → Environment:
+
 | Variable | Value |
 |---|---|
-| `XAI_API_KEY` | Your xAI API key |
-| `GROK_MODEL` | `grok-4.7` |
-| `GEMINI_API_KEY` | Google Gemini API key (required for embeddings and fallback) |
-| `GEMINI_MODEL` | `gemini-2.5-flash` |
-| `EMBEDDING_MODEL` | `gemini-embedding-001` |
+| XAI_API_KEY | Your xAI API key |
+| GROK_MODEL | grok-4.7 |
+| GEMINI_API_KEY | Google Gemini API key (required for embeddings and fallback) |
+| GEMINI_MODEL | gemini-2.5-flash |
+| EMBEDDING_MODEL | gemini-embedding-001 |
 
-Save environment variables and redeploy the Render service.
+Save environment variables and redeploy the Render service. API keys are never requested in the browser.
 
 ## Local setup
-1. Use Python 3.10 or newer.
+1. Use Python 3.11 or newer.
 2. Create and activate a virtual environment.
-3. Install dependencies: `pip install -r requirements.txt`.
-4. Add the environment variables above to `.env`.
-5. Run: `streamlit run app.py`.
+3. Install dependencies: pip install -r requirements.txt.
+4. Add the environment variables above to .env.
+5. Run: streamlit run app.py.
 
-## Performance and reliability
-- FAISS performs vector similarity search over document embeddings.
-- Question generation and answer generation are two separate batched LLM calls, not one call per answer.
-- Grok requests retry transient failures; Gemini is attempted if Grok fails.
-- The FAISS index and document chunks are held in memory for the active generation run.
+## Runtime and privacy
+- Uploaded files, extracted chunks, and the FAISS index are held in memory for the active generation run; no persistent vector database is configured.
+- Document text is sent to Google's embedding API to create vectors.
+- Retrieved text is sent to Grok, or Gemini when generation fallback is used.
 - Uploads are limited to 20 MB per file; extracted text is capped at 250,000 characters and chunk processing at 300 chunks.
-
-Embedding generation and both LLM stages require provider connectivity. If embedding or both generation providers fail, check Render logs and verify API keys, model access, and quota.
-
-## Privacy
-There is no login system or persistent document/vector database. Uploaded files, extracted chunks, and the FAISS index are processed in memory for the active session/run. Document text is sent to Google's embedding API to create vectors. Retrieved text is sent to Grok, or Gemini if generation fallback is used. Do not upload confidential material unless you are comfortable sharing it with those providers.
-
-Generated answers may contain mistakes; verify them before relying on them in an interview.
+- The Refine chain improves coverage across retrieved passages but adds sequential model calls; actual latency depends on provider response times and quota.
+- Generated answers may contain mistakes; verify them before relying on them in an interview.
