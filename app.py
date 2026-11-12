@@ -243,7 +243,6 @@ def invoke_with_resilience(prompt: str) -> str:
                     model=GROQ_MODEL,
                     input=prompt,
                     reasoning={"effort": "low"},
-                    store=False,
                 )
                 generated = _extract_text(response)
                 if not generated:
