@@ -561,6 +561,10 @@ def main():
         if any(f.size > MAX_UPLOAD_MB * 1024 * 1024 for f in files):
             st.error(f"Each uploaded file must be {MAX_UPLOAD_MB} MB or smaller.")
         else:
+            chunks = None
+            vector_store = None
+            query_embeddings = None
+            retrieved = None
             try:
                 with st.status("Preparing your interview set…", expanded=True) as status:
                     st.write("Extracting text and building source chunks")
@@ -575,29 +579,35 @@ def main():
                         retrieved, topic, role, difficulty, int(count),
                         progress_callback=status.write,
                     )
-                    status.update(label="Your interview set is ready", state="complete", expanded=False)
-                st.session_state["results"] = results
-                st.session_state["all_chunks"] = [
-                    {
-                        "source": chunk.metadata.get("source", "document"),
-                        "source_index": chunk.metadata.get("source_index", 0),
-                        "chunk_id": chunk.metadata.get("chunk_id", 0),
-                        "text": chunk.page_content,
+
+                    # Preserve only the content required by the results UI.
+                    saved_chunks = [
+                        {
+                            "source": chunk.metadata.get("source", "document"),
+                            "source_index": chunk.metadata.get("source_index", 0),
+                            "chunk_id": chunk.metadata.get("chunk_id", 0),
+                            "text": chunk.page_content,
+                        }
+                        for chunk in chunks
+                    ]
+                    saved_retrieved_keys = {
+                        (chunk.metadata.get("source", "document"), chunk.metadata.get("chunk_id", 0))
+                        for chunk in retrieved
                     }
-                    for chunk in chunks
-                ]
-                st.session_state["retrieved_chunk_keys"] = {
-                    (chunk.metadata.get("source", "document"), chunk.metadata.get("chunk_id", 0))
-                    for chunk in retrieved
-                }
-                st.session_state["run_meta"] = {
-                    "files": [f.name for f in files],
-                    "chunks": len(chunks),
-                    "retrieved": len(retrieved),
-                    "topic": topic or "Document topics",
-                    "role": role or "General technical role",
-                    "difficulty": difficulty,
-                }
+                    saved_run_meta = {
+                        "files": [f.name for f in files],
+                        "chunks": len(chunks),
+                        "retrieved": len(retrieved),
+                        "topic": topic or "Document topics",
+                        "role": role or "General technical role",
+                        "difficulty": difficulty,
+                    }
+                    status.update(label="Your interview set is ready", state="complete", expanded=False)
+
+                st.session_state["results"] = results
+                st.session_state["all_chunks"] = saved_chunks
+                st.session_state["retrieved_chunk_keys"] = saved_retrieved_keys
+                st.session_state["run_meta"] = saved_run_meta
                 st.success(f"Generated {len(results)} interview question-and-answer pairs.")
             except Exception as exc:
                 # Keep the complete provider traceback in Render logs for diagnosis,
@@ -611,6 +621,12 @@ def main():
                     "and inspect the latest 'Interview question generation failed' entry. "
                     "Do not share your API key or environment-variable values."
                 )
+            finally:
+                # Drop references to temporary RAG objects on both success and failure.
+                retrieved = None
+                vector_store = None
+                query_embeddings = None
+                chunks = None
 
     if "results" in st.session_state:
         st.write("")
