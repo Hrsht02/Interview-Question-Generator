@@ -259,14 +259,33 @@ def invoke_with_resilience(prompt: str) -> str:
 
 
 def parse_json_array(raw: str):
-    cleaned = re.sub(r"^\s*```(?:json)?|\`\`\`\s*$", "", raw.strip(), flags=re.I)
-    start, end = cleaned.find("["), cleaned.rfind("]")
-    if start < 0 or end <= start:
-        raise ValueError("The AI response was not in the expected format. Please retry.")
-    data = json.loads(cleaned[start:end + 1])
+    cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", raw.strip(), flags=re.I)
+    start = cleaned.find("[")
+    if start < 0:
+        raise ValueError("The AI response did not contain a JSON array.")
+    try:
+        data, _ = json.JSONDecoder().raw_decode(cleaned[start:])
+    except json.JSONDecodeError as exc:
+        raise ValueError("The AI response contained invalid JSON.") from exc
     if not isinstance(data, list):
         raise ValueError("The AI response had an unexpected format.")
     return data
+
+
+def invoke_json_array(prompt: str, stage_name: str):
+    """Call a provider and make one format-repair attempt if its JSON is malformed."""
+    raw = invoke_with_resilience(prompt)
+    try:
+        return parse_json_array(raw)
+    except ValueError:
+        logger.warning("%s returned malformed JSON; requesting one format correction.", stage_name)
+        repair_prompt = (
+            "Convert the following model output into a valid JSON array. "
+            "Preserve its information without adding new facts. Return only JSON, "
+            "with no markdown fences or commentary.\n\n"
+            f"MODEL OUTPUT TO REPAIR:\n{json.dumps(raw[:18000], ensure_ascii=False)}"
+        )
+        return parse_json_array(invoke_with_resilience(repair_prompt))
 
 
 def generate_interview_questions(chunks, topic: str, role: str, difficulty: str, count: int):
@@ -297,7 +316,7 @@ RETRIEVED CONTEXT:
         difficulty=difficulty,
         context=context,
     )
-    raw_questions = parse_json_array(invoke_with_resilience(question_prompt))
+    raw_questions = invoke_json_array(question_prompt, "Question generation")
     questions = []
     for item in raw_questions:
         if not isinstance(item, dict) or not str(item.get("question", "")).strip():
@@ -389,10 +408,17 @@ NEW SOURCE PASSAGE ({source_label}):
             source_label=f"{first.metadata.get('source', 'document')} · chunk {first.metadata.get('chunk_id', '?')}",
             context=first.page_content,
         )
-        initial_items = parse_json_array(invoke_with_resilience(initial_prompt))
+        initial_items = invoke_json_array(initial_prompt, "Initial answer generation")
         answers = self._normalise_items(initial_items, questions)
-        if not answers:
-            raise ValueError("The initial answer pass returned no usable answers.")
+        answer_ids = {item["question_id"] for item in answers}
+        expected_ids = {item["question_id"] for item in questions}
+        if answer_ids != expected_ids:
+            missing_ids = sorted(expected_ids - answer_ids)
+            raise ValueError(
+                "The initial answer pass missed question(s): "
+                + ", ".join(missing_ids)
+                + ". Please retry generation."
+            )
 
         # Refine the complete answer batch sequentially with each remaining retrieved document.
         for index, document in enumerate(documents[1:], start=2):
@@ -408,7 +434,7 @@ NEW SOURCE PASSAGE ({source_label}):
                 source_label=f"{document.metadata.get('source', 'document')} · chunk {document.metadata.get('chunk_id', '?')}",
                 context=document.page_content,
             )
-            refined_items = parse_json_array(invoke_with_resilience(refine_prompt))
+            refined_items = invoke_json_array(refine_prompt, "Answer refinement")
             refined = self._normalise_items(refined_items, questions)
 
             # Keep the previous answer if a provider omits one ID in a refinement response.
