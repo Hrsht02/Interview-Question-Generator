@@ -16,6 +16,7 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from openai import OpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import PromptTemplate
 
 load_dotenv()
 
@@ -268,93 +269,217 @@ def parse_json_array(raw: str):
     return data
 
 
-def generate_interview_set(chunks, topic: str, role: str, difficulty: str, count: int, progress_callback=None):
-    """Two-stage generation: first create questions, then generate grounded answers."""
+def generate_interview_questions(chunks, topic: str, role: str, difficulty: str, count: int):
+    """Stage 1: generate questions from the complete retrieved context."""
     context = "\n\n".join(
-        f"[Source: {d.metadata.get('source', 'document')} | chunk {d.metadata.get('chunk_id', '?')}]\n"
-        f"{d.page_content}"
-        for d in chunks
+        f"[Source: {doc.metadata.get('source', 'document')} | chunk {doc.metadata.get('chunk_id', '?')}]\n"
+        f"{doc.page_content}"
+        for doc in chunks
     )
+    question_prompt = PromptTemplate.from_template(
+        """You are an expert technical interviewer.
+Generate exactly {count} distinct interview questions.
+Topic/focus: {topic}
+Target role: {role}
+Difficulty: {difficulty}
+
+Use the retrieved context as the factual basis. Questions should test understanding and
+practical application, fit the target role, and avoid duplicates. Do not include answers.
+Return ONLY a valid JSON array. Each object must contain "question", "concept", "source_hint".
+No markdown fences or commentary.
+
+RETRIEVED CONTEXT:
+{context}"""
+    ).format(
+        count=count,
+        topic=topic or "Relevant topics from uploaded material",
+        role=role or "General technical role",
+        difficulty=difficulty,
+        context=context,
+    )
+    raw_questions = parse_json_array(invoke_with_resilience(question_prompt))
+    questions = []
+    for item in raw_questions:
+        if not isinstance(item, dict) or not str(item.get("question", "")).strip():
+            continue
+        questions.append({
+            "question_id": f"Q{len(questions) + 1}",
+            "question": str(item["question"]).strip(),
+            "concept": str(item.get("concept", "")).strip(),
+            "source_hint": str(item.get("source_hint", "")).strip(),
+        })
+        if len(questions) >= count:
+            break
+    if len(questions) != count:
+        raise ValueError(
+            f"Question generation returned {len(questions)} of {count} requested questions. Please retry."
+        )
+    return questions
+
+
+class RefineAnswerChain:
+    """Sequential Refine chain: seed answers from one document, then refine with each next document.
+
+    Each model call handles the full question batch, keeping the number of calls proportional
+    to retrieved documents rather than multiplying it by the number of questions.
+    """
+
+    initial_prompt = PromptTemplate.from_template(
+        """You are an expert technical interview coach.
+Create an accurate, interview-ready initial answer for every question.
+Target role: {role}
+Difficulty: {difficulty}
+
+Use ONLY the source passage below for factual claims. Explain clearly and include a concise
+example only when supported by the passage. If the passage does not contain enough evidence,
+say what is missing rather than inventing details.
+Return ONLY a valid JSON array with one object per question, using exactly "question_id" and "answer".
+Preserve every question_id. No markdown fences or commentary.
+
+QUESTIONS:
+{questions}
+
+INITIAL SOURCE PASSAGE ({source_label}):
+{context}"""
+    )
+
+    refine_prompt = PromptTemplate.from_template(
+        """You are refining draft interview answers using additional retrieved evidence.
+Target role: {role}
+Difficulty: {difficulty}
+
+For every question, improve the existing answer using the NEW SOURCE PASSAGE.
+- Preserve correct information already in the draft.
+- Add useful details, definitions, examples, or qualifications supported by the new passage.
+- Resolve contradictions cautiously; do not invent facts or claim unsupported certainty.
+- If the passage is irrelevant to a question, leave that answer substantively unchanged.
+- Keep answers concise, clear, and suitable to speak in an interview.
+Return ONLY a valid JSON array containing every question_id and its refined "answer".
+Do not omit any question_id. No markdown fences or commentary.
+
+QUESTIONS:
+{questions}
+
+CURRENT DRAFT ANSWERS:
+{current_answers}
+
+NEW SOURCE PASSAGE ({source_label}):
+{context}"""
+    )
+
+    def __init__(self, role: str, difficulty: str, progress_callback=None):
+        self.role = role or "General technical role"
+        self.difficulty = difficulty
+        self.progress_callback = progress_callback
+
+    def invoke(self, questions, documents):
+        if not documents:
+            raise ValueError("Refine chain requires at least one retrieved source passage.")
+
+        # Initial answer pass over the first retrieved document.
+        first = documents[0]
+        if self.progress_callback:
+            self.progress_callback(
+                f"Stage 2/2 · Initial answers from source chunk 1/{len(documents)}"
+            )
+        initial_prompt = self.initial_prompt.format(
+            role=self.role,
+            difficulty=self.difficulty,
+            questions=json.dumps(questions, ensure_ascii=False),
+            source_label=f"{first.metadata.get('source', 'document')} · chunk {first.metadata.get('chunk_id', '?')}",
+            context=first.page_content,
+        )
+        initial_items = parse_json_array(invoke_with_resilience(initial_prompt))
+        answers = self._normalise_items(initial_items, questions)
+        if not answers:
+            raise ValueError("The initial answer pass returned no usable answers.")
+
+        # Refine the complete answer batch sequentially with each remaining retrieved document.
+        for index, document in enumerate(documents[1:], start=2):
+            if self.progress_callback:
+                self.progress_callback(
+                    f"Refine chain · incorporating source chunk {index}/{len(documents)}"
+                )
+            refine_prompt = self.refine_prompt.format(
+                role=self.role,
+                difficulty=self.difficulty,
+                questions=json.dumps(questions, ensure_ascii=False),
+                current_answers=json.dumps(answers, ensure_ascii=False),
+                source_label=f"{document.metadata.get('source', 'document')} · chunk {document.metadata.get('chunk_id', '?')}",
+                context=document.page_content,
+            )
+            refined_items = parse_json_array(invoke_with_resilience(refine_prompt))
+            refined = self._normalise_items(refined_items, questions)
+
+            # Keep the previous answer if a provider omits one ID in a refinement response.
+            refined_by_id = {item["question_id"]: item["answer"] for item in refined}
+            answers = [
+                {
+                    "question_id": current["question_id"],
+                    "answer": refined_by_id.get(current["question_id"], current["answer"]),
+                }
+                for current in answers
+            ]
+
+        return answers
+
+    @staticmethod
+    def _normalise_items(items, questions):
+        allowed_ids = {question["question_id"] for question in questions}
+        normalised = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            question_id = str(item.get("question_id", "")).strip()
+            answer = str(item.get("answer", "")).strip()
+            if question_id in allowed_ids and answer:
+                normalised[question_id] = {
+                    "question_id": question_id,
+                    "answer": answer,
+                }
+        return list(normalised.values())
+
+
+def generate_interview_set(chunks, topic: str, role: str, difficulty: str, count: int, progress_callback=None):
+    """Two-stage pipeline: question generation followed by a sequential Refine answer chain."""
+    if not chunks:
+        raise ValueError("No relevant source passages were retrieved. Try another topic or document.")
 
     if progress_callback:
         progress_callback("Stage 1/2 · Generating interview questions")
-    question_prompt = f"""
-You are an expert technical interviewer.
-Generate exactly {count} distinct interview questions.
-Topic/focus: {topic or "Relevant topics from the uploaded material"}
-Target role: {role or "General technical role"}
-Difficulty: {difficulty}
+    questions = generate_interview_questions(chunks, topic, role, difficulty, count)
 
-Use the retrieved source context as the factual basis. Questions should test understanding
-and practical application, fit the target role, and avoid duplicates.
-Return ONLY a valid JSON array of objects with fields "question", "concept", "source_hint".
-Do not include answers in this stage. No markdown fences or surrounding commentary.
-
-RETRIEVED SOURCE CONTEXT:
-{context}
-"""
-    question_items = parse_json_array(invoke_with_resilience(question_prompt))
-    questions = [
-        {
-            "question": str(item.get("question", "")).strip(),
-            "concept": str(item.get("concept", "")).strip(),
-            "source_hint": str(item.get("source_hint", "")).strip(),
-        }
-        for item in question_items
-        if isinstance(item, dict) and item.get("question")
-    ][:count]
-    if not questions:
-        raise ValueError("The question-generation stage returned no usable questions.")
-
-    if progress_callback:
-        progress_callback("Stage 2/2 · Generating grounded answers")
-    answer_prompt = f"""
-You are an expert technical interview coach.
-Write an accurate, interview-ready answer for each question below.
-Target role: {role or "General technical role"}
-Difficulty: {difficulty}
-
-Use the retrieved context as the primary source of truth. Explain clearly and add a concise
-practical example where useful. Do not invent facts absent from the context. If the context
-is insufficient, state that explicitly. Keep each question text unchanged.
-
-QUESTIONS:
-{json.dumps(questions, ensure_ascii=False)}
-
-Return ONLY a valid JSON array with one object per question and fields "question", "answer".
-No markdown fences and no text outside the JSON array.
-
-RETRIEVED SOURCE CONTEXT:
-{context}
-"""
-    answer_items = parse_json_array(invoke_with_resilience(answer_prompt))
-    answers_by_question = {
-        str(item.get("question", "")).strip(): str(item.get("answer", "")).strip()
-        for item in answer_items
-        if isinstance(item, dict) and item.get("question") and item.get("answer")
+    refine_chain = RefineAnswerChain(
+        role=role,
+        difficulty=difficulty,
+        progress_callback=progress_callback,
+    )
+    refined_answers = refine_chain.invoke(questions, chunks)
+    answer_by_id = {
+        item["question_id"]: item["answer"]
+        for item in refined_answers
     }
 
     results = []
-    for index, item in enumerate(questions):
-        answer = answers_by_question.get(item["question"])
-        if not answer and index < len(answer_items) and isinstance(answer_items[index], dict):
-            answer = str(answer_items[index].get("answer", "")).strip()
-        if answer:
-            results.append({
-                **item,
-                "answer": answer,
-                "sources": [
-                    {
-                        "source": doc.metadata.get("source", "document"),
-                        "chunk_id": doc.metadata.get("chunk_id", "?"),
-                        "text": doc.page_content,
-                    }
-                    for doc in chunks
-                ],
-            })
-    if not results:
-        raise ValueError("The answer-generation stage returned no usable answers.")
-    return results[:count]
+    for question in questions:
+        answer = answer_by_id.get(question["question_id"])
+        if not answer:
+            raise ValueError(
+                f"No refined answer was produced for {question['question_id']}. Please retry."
+            )
+        results.append({
+            **question,
+            "answer": answer,
+            "sources": [
+                {
+                    "source": doc.metadata.get("source", "document"),
+                    "chunk_id": doc.metadata.get("chunk_id", "?"),
+                    "text": doc.page_content,
+                }
+                for doc in chunks
+            ],
+        })
+    return results
 
 
 def main():
@@ -479,6 +604,13 @@ def main():
                 if item.get("source_hint"):
                     st.markdown("**Why this question is relevant**")
                     st.caption(item["source_hint"])
+                if item.get("sources"):
+                    with st.expander(f"Sources used · {len(item['sources'])} retrieved passages"):
+                        for source in item["sources"]:
+                            st.markdown(
+                                f"**{source['source']} · Chunk {source['chunk_id']}**"
+                            )
+                            st.caption(source["text"])
             export.append(
                 f"## Question {idx}\n{item['question']}\n\n### Suggested answer\n{item['answer']}\n"
                 + (f"\n**Concept:** {item['concept']}\n" if item.get("concept") else "")
@@ -515,8 +647,8 @@ def main():
 
     st.divider()
     st.markdown(
-        '<div class="small-note"><strong>How it works:</strong> Document extraction → Recursive chunking → Gemini embeddings → FAISS semantic search → Question prompt → Answer prompt → Interview-ready Q&A</div>'
-        '<div class="small-note">Gemini creates embeddings · Grok generates questions and answers, with Gemini fallback · Documents and FAISS index are processed in memory for this session.</div>',
+        '<div class="small-note"><strong>How it works:</strong> Document extraction → Recursive chunking → Gemini embeddings → FAISS semantic search → Question generation → Initial answer → Sequential Refine chain → Interview-ready Q&A</div>'
+        '<div class="small-note">Gemini creates embeddings · Grok generates questions and runs the Refine chain, with Gemini fallback · Documents and FAISS index are processed in memory for this session.</div>',
         unsafe_allow_html=True,
     )
 
